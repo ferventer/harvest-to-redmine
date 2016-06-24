@@ -1,15 +1,15 @@
 # /usr/bin/env python
 
-
 '''HarvestToRedmine.
 
-Usage:
-    harvesttoredmine [options]
-    harvesttoredmine sync (today|yesterday|week | --date <date>)
+    Usage:
+        harvesttoredmine.py sync [--t|--y|--w|--d <date>]
 
-Options:
-  -h --help          Show this screen.
-  --version          Show the version.
+    Options:
+          --t                Sync issues for today, if you provide no arguments this is option by default
+          --y                Sync issues for yesterday
+          --w                Sync issues for whole last week from Monday to Friday
+          --d                Sync issues for specific date, today by default
 '''
 
 from getpass import getpass
@@ -32,16 +32,16 @@ def _check_activities_compability(redmine_client, harvest_activities):
         u'Deployment', u'Documentation', u'Retest', u'Work', u'Other'
     """
     harvest_activities = harvest_activities.split(',')
-    redmine_activities = [activity.name for activity in redmine_client.time_entry_activities]
-    nf_redmine_activities = set(harvest_activities) - set(redmine_activities)
+    redmine_activities = {activity.name: activity.id for activity in redmine_client.time_entry_activities}
+    nf_redmine_activities = set(harvest_activities) - set(redmine_activities.keys())
 
     if nf_redmine_activities:
         raise ValueError('Cant find these Harvest activity types in redmine {}'.format(nf_redmine_activities))
     else:
-        return True
+        return redmine_activities
 
 
-def _log_day_entries_to_redmine(day_entry, in_date, redmine_client, harvest_client):
+def _log_day_entries_to_redmine(day_entry, in_date, redmine_client, harvest_client, default_ticket, redmine_activities):
     if day_entry.get('client') != 'Yellow':
         return
 
@@ -56,22 +56,23 @@ def _log_day_entries_to_redmine(day_entry, in_date, redmine_client, harvest_clie
             err = "Can't parse ID on %s" % day_entry['notes']
             return "Failed", '', err, bcolors.RED
     else:
-        ticket_id = 37080
+        ticket_id = default_ticket
         entry_notes = day_entry['notes']
 
     issue = redmine_client.issues[ticket_id]
+    activity = redmine_activities.get(day_entry['task'] or 'Development')
 
     try:
-        redmine_client.time_entries.new(issue=issue, activity=day_entry['task'],
-                                        spent_on=in_date.strftime('%Y-%m-%d'), user=redmine_client.user,
+        redmine_client.time_entries.new(issue=issue, activity=activity,
+                                        spent_on=in_date, user=redmine_client.user,
                                         hours=day_entry['hours'], comments=entry_notes)
     except Exception as err:
-        return "Failed", ticket_id, err, bcolors.RED
+        return "Failed", ticket_id, err.message, bcolors.RED
 
     if day_entry['notes'] == '':
-        day_entry['notes'] = 'Logged'
+        day_entry['notes'] = 'logged'
     else:
-        day_entry['notes'] += ' Logged'
+        day_entry['notes'] += ' logged'
 
     try:
         harvest_client.update(day_entry['id'], day_entry)
@@ -99,29 +100,49 @@ def _table_header():
             get_color_string(bcolors.BLUE, "Err")]
 
 
+def _rtime(time, res):
+    return round(time / int(res), 2) * int(res) if res else time
+
+
 def parse_date(password, config, args):
-    in_date = datetime.today()
+    in_dates = [datetime.today()]
 
-    if args['--date']:
+    if args['--d']:
         if args[1].count('/') == 1:
+            in_dates = []
             for day in xrange(1, 32):
-                sync_hours(password, config, datetime.datetime(datetime.datetime(year=int(str.split('/')[1]),
-                                                                                 month=int(str.split('/')[0]),
-                                                                                 day=day)))
-    if args['yesterday']:
-        in_date = in_date - timedelta(1)
-    if args['week']:
-        start_week = in_date - timedelta(in_date.weekday())
+                in_dates.append(datetime.datetime(datetime.datetime(year=int(str.split('/')[1]),
+                                                                    month=int(str.split('/')[0]),
+                                                                    day=day)))
+        else:
+            try:
+                in_dates = [datetime.strptime(args[1], "%Y-%m-%d")]
+            except ValueError:
+                print "Wrong date, please use YYYY-MM-DD format."
+                return
+    if args['--y']:
+        in_dates = [in_dates[0] - timedelta(1)]
+    if args['--w']:
+        start_week = in_dates[0] - timedelta(days=7 + in_dates[0].weekday())
+        in_dates = []
         for delta in range(0, 4):
-            sync_hours(start_week + timedelta(days=delta))
-    sync_hours(password, config, in_date)
+            in_dates.append(start_week + timedelta(days=delta))
+    sync_hours(password, config, in_dates)
 
 
-def sync_hours(password, config, in_date):
-    in_date_time = in_date.timetuple()
+def get_harvest_entries(harvest_client, config, in_dates):
+    day_entries = {}
+    for in_date in in_dates:
+        in_date_time = in_date.timetuple()
+        doy = in_date_time.tm_yday
+        day = harvest_client.get_day(doy, in_date.year)
+        entries = filter(lambda entry: entry.get('notes') != 'logged', day.get('day_entries', []))
+        if entries:
+            day_entries[in_date.strftime("%Y-%m-%d")] = entries
+    return day_entries
 
-    doy = in_date_time.tm_yday
 
+def sync_hours(password, config, in_dates):
     try:
         harvest_client = Harvest(config.get('harvest', 'url'), config.get('harvest', 'email'), password)
     except Exception as err:
@@ -133,25 +154,34 @@ def sync_hours(password, config, in_date):
     except Exception as err:
         print "There is a problem with connecting to Redmine: {0}".format(err)
 
-    day = harvest_client.get_day(doy, in_date.year)
+    default_ticket = config.get('redmine', 'default_ticket')
 
     try:
-        _check_activities_compability(redmine_client, config.get('harvest', 'activities'))
+        redmine_activities = _check_activities_compability(redmine_client, config.get('harvest', 'activities'))
     except ValueError as err:
         print err.message
         return
 
-    day_entries = filter(lambda entry: entry.get('notes') != 'Logged', day.get('day_entries', []))
+    harvest_entries = get_harvest_entries(harvest_client, config, in_dates)
+    round_time = config.get('redmine', 'round_time')
 
-    sync_table = _table_init()
-    rows = [_table_header()]
-    for day_entry in tqdm(day_entries, total=len(day_entries), leave=True):
-        time_entry = _log_day_entries_to_redmine(day_entry, in_date, redmine_client, harvest_client)
-        rows.append([in_date.strftime('%d-%m-%Y'), str(time_entry[1]), str(day_entry.get('hours')),
-                     get_color_string(time_entry[3], time_entry[0]),
-                     time_entry[2] or '--'])
-    sync_table.add_rows(rows)
-    print(sync_table.draw() + "\n")
+    for date, date_entries in harvest_entries.iteritems():
+        print "Syncing days for {}".format(date)
+        sync_table = _table_init()
+        for day_entry in tqdm(date_entries, total=len(date_entries), leave=True):
+            rows = [_table_header()]
+            day_entry['hours'] = _rtime(day_entry.get('hours'), round_time)
+
+            time_entry = _log_day_entries_to_redmine(day_entry, date, redmine_client, harvest_client,
+                                                     default_ticket, redmine_activities)
+
+            rows.append([date, str(time_entry[1]),
+                         str(day_entry.get('hours')),
+                         get_color_string(time_entry[3], time_entry[0]),
+                         time_entry[2] or '--'])
+
+        sync_table.add_rows(rows)
+        print(sync_table.draw() + "\n")
 
 
 def _harvest_auth():
@@ -178,8 +208,7 @@ def main():
 
     config = _read_config()
     password = _harvest_auth()
-    if args['sync']:
-        parse_date(password, config, args)
+    parse_date(password, config, args)
 
 
 if __name__ == '__main__':
